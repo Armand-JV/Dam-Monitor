@@ -2,6 +2,10 @@
 
 Satellite imaging monitoring app. Spring Boot backend + Vite frontend.
 
+## Live Teams Demo Recording
+
+https://youtu.be/miRuQe2YkbY
+
 ## Quick Start
 
 ### Prerequisites
