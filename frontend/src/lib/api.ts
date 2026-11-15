@@ -70,12 +70,13 @@ export async function uploadReport(payload: {
   return (await response.json()) as EnvironmentalReport;
 }
 
-export async function fetchSatelliteSnapshot(cacheBuster: number): Promise<{
+export async function fetchSatelliteSnapshot(cacheBuster: number, forceRefresh = false): Promise<{
   objectUrl: string;
   acquiredAt: string | null;
   sourceCollection: string | null;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/satellite?ts=${cacheBuster}`);
+  const refreshQuery = forceRefresh ? "&refresh=true" : "";
+  const response = await fetch(`${API_BASE_URL}/api/satellite?ts=${cacheBuster}${refreshQuery}`);
   if (!response.ok) {
     throw new Error("Failed to fetch live satellite image from backend.");
   }

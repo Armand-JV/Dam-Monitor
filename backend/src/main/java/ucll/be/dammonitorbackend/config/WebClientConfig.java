@@ -9,7 +9,7 @@ import org.springframework.web.reactive.function.client.WebClient;
  *
  * We define it here so it is created once and reused across the application.
  * The default codec buffer size is raised to 10 MB to comfortably handle
- * satellite image payloads returned by the Sentinel Hub process API.
+ * satellite catalogue and image asset responses.
  */
 @Configuration
 public class WebClientConfig {

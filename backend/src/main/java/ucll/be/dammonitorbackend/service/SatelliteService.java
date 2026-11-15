@@ -2,397 +2,450 @@ package ucll.be.dammonitorbackend.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.RenderingHints;
+import java.awt.geom.AffineTransform;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReadParam;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
-import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 
 /**
- * SatelliteService
- *
- * Three-step flow:
- *
- * 1. OAuth2 — obtains a bearer token via client credentials.
- *
- * 2. Catalogue API — queries the Sentinel Hub STAC catalogue for the most
- * recent Sentinel-2 L2A scene over Hartbeespoort Dam with
- * ≤ 20 % cloud cover. Reads the exact capture datetime
- * directly from {@code properties.datetime} in the response.
- *
- * 3. Process API — fetches a true-colour PNG, with the time window pinned to
- * the 24-hour day of the verified scene date so that the
- * image and the date are guaranteed to match.
- *
- * The result is a {@link SatelliteImageResult} whose {@code dateTaken} field
- * is sourced from the catalogue — it is the real satellite overpass time,
- * not an estimate.
+ * Searches Digital Earth Africa STAC for a suitable Sentinel-2 scene and
+ * renders the scene's visual Cloud-Optimized GeoTIFF as a JPEG preview.
  */
 @Service
 public class SatelliteService {
 
     private static final Logger log = LoggerFactory.getLogger(SatelliteService.class);
 
-    // ── Injected properties ───────────────────────────────────────────────────
-
-    @Value("${sentinel.hub.client-id}")
-    private String clientId;
-
-    @Value("${sentinel.hub.client-secret}")
-    private String clientSecret;
-
-    @Value("${sentinel.hub.token-url}")
-    private String tokenUrl;
-
-    @Value("${sentinel.hub.process-url}")
-    private String processUrl;
-
-    /**
-     * Added to application.properties:
-     * sentinel.hub.catalogue-url=https://services.sentinel-hub.com/api/v1/catalog/1.0.0/search
-     */
-    @Value("${sentinel.hub.catalogue-url}")
-    private String catalogueUrl;
-
-    // ── Hartbeespoort Dam bounding box (WGS84 lon/lat) ───────────────────────
-
-    private static final double BBOX_MIN_LON = 27.78822;
-    private static final double BBOX_MIN_LAT = -25.77346;
-    private static final double BBOX_MAX_LON = 27.907053;
-    private static final double BBOX_MAX_LAT = -25.723519;
-
-    // ── Catalogue lookback window ─────────────────────────────────────────────
-    // How many days back to search when looking for the latest cloud-free scene.
-    private static final int CATALOGUE_LOOKBACK_DAYS = 30;
-
-    // ── Cloud cover threshold shared by catalogue filter AND Process API ──────
-    // Keeping these in sync prevents the Process API rendering a black image
-    // for a scene the catalogue accepted but the Process API then rejects.
+    private static final double BBOX_MIN_LON = 27.786741;
+    private static final double BBOX_MIN_LAT = -25.775772;
+    private static final double BBOX_MAX_LON = 27.910681;
+    private static final double BBOX_MAX_LAT = -25.721965;
+    private static final String SEARCH_DATETIME = "2026-10-01T00:00:00Z/2026-11-15T23:59:59Z";
     private static final double MAX_CLOUD_COVER_PCT = 20.0;
+    private static final int MAX_PREVIEW_WIDTH = 1200;
+    private static final int MAX_PREVIEW_HEIGHT = 900;
+    private static final String VISUAL_ASSET_HOST = "deafrica-sentinel-2.s3.af-south-1.amazonaws.com";
 
     private final WebClient webClient;
+    private final String stacSearchUrl;
+    private volatile SatelliteImageResult cachedImage;
 
-    public SatelliteService(WebClient webClient) {
+    public SatelliteService(
+            WebClient webClient,
+            @Value("${digital-earth-africa.stac-search-url}") String stacSearchUrl) {
         this.webClient = webClient;
+        this.stacSearchUrl = stacSearchUrl;
     }
 
-    // =========================================================================
-    // Public result type
-    // =========================================================================
-
-    /**
-     * Represents a satellite collection with its ID and display name.
-     */
     public record Collection(String id, String displayName) {
     }
 
-    /**
-     * Carries the image, its verified capture date, and the collection used.
-     *
-     * @param imageBytes Raw PNG bytes ready to stream to the client.
-     * @param dateTaken  Exact satellite overpass time read from the Sentinel Hub
-     *                   Catalogue API ({@code features[0].properties.datetime}).
-     *                   This is not an estimate — it is the actual capture time
-     *                   recorded in the STAC metadata.
-     * @param collection The satellite collection used for the image.
-     */
-    public record SatelliteImageResult(byte[] imageBytes, Instant dateTaken, Collection collection) {
+    public record SatelliteImageResult(
+            byte[] imageBytes,
+            Instant dateTaken,
+            Collection collection,
+            String assetUrl) {
     }
 
-    // =========================================================================
-    // Private helper types
-    // =========================================================================
-
-    private record SceneInfo(Instant dateTaken, Collection collection) {
-    }
-
-    // =========================================================================
-    // Public API
-    // =========================================================================
-
-    /**
-     * Fetches the most recent cloud-free Sentinel-2 image of Hartbeespoort Dam
-     * together with its exact, catalogue-verified capture date.
-     *
-     * @return {@link SatelliteImageResult}
-     * @throws RuntimeException on auth failure, no scenes found, or image fetch
-     *                          error
-     */
-    public SatelliteImageResult fetchSatelliteImage() {
-        log.info("Fetching Sentinel-2 image for Hartbeespoort Dam");
-
-        // Step 1 — authenticate once; token is reused for both subsequent calls
-        String token = fetchAccessToken();
-        log.info("Access token obtained");
-
-        // Step 2 — ask the catalogue for the exact overpass time of the latest scene
-        SceneInfo sceneInfo = fetchLatestSceneDate(token);
-        log.info("Catalogue confirmed scene date: {}", sceneInfo.dateTaken());
-
-        // Step 3 — fetch the image pinned to that scene's calendar day
-        byte[] imageBytes = fetchImage(token, sceneInfo.dateTaken());
-        log.info("Image received ({} bytes)", imageBytes.length);
-
-        return new SatelliteImageResult(imageBytes, sceneInfo.dateTaken(), sceneInfo.collection());
-    }
-
-    // =========================================================================
-    // Step 1 — OAuth2 client-credentials token
-    // =========================================================================
-
-    private String fetchAccessToken() {
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("grant_type", "client_credentials");
-        form.add("client_id", clientId);
-        form.add("client_secret", clientSecret);
-
-        JsonNode resp = webClient.post()
-                .uri(tokenUrl)
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(BodyInserters.fromFormData(form))
-                .retrieve()
-                .onStatus(
-                        s -> s.is4xxClientError() || s.is5xxServerError(),
-                        r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("Token request failed: {} — {}", r.statusCode(), body);
-                            return new RuntimeException("Token failed: " + body);
-                        }))
-                .bodyToMono(JsonNode.class)
-                .block();
-
-        if (resp == null || !resp.has("access_token")) {
-            throw new RuntimeException("No access_token in response");
+    public static class SatelliteImageUnavailableException extends RuntimeException {
+        public SatelliteImageUnavailableException(String message) {
+            super(message);
         }
-        return resp.get("access_token").asText();
     }
 
-    // =========================================================================
-    // Step 2 — Catalogue API: resolve the exact capture datetime
-    // =========================================================================
+    private record SceneInfo(
+            Instant dateTaken,
+            double cloudCover,
+            JsonNode feature,
+            String visualAssetUrl) {
+    }
 
-    /**
-     * Calls the Sentinel Hub STAC Catalogue ({@code /catalog/1.0.0/search}) to
-     * find the single most recent Sentinel-2 L2A scene that:
-     * <ul>
-     * <li>intersects the Hartbeespoort Dam bounding box</li>
-     * <li>has ≤ {@value #MAX_CLOUD_COVER_PCT} % cloud cover ({@code eo:cloud_cover})</li>
-     * <li>was captured within the last {@value #CATALOGUE_LOOKBACK_DAYS} days</li>
-     * </ul>
-     *
-     * The catalogue response is a GeoJSON FeatureCollection. We retrieve
-     * multiple scenes and filter/sort them client-side to find the newest
-     * qualifying scene. We read {@code features[0].properties.datetime}
-     * — an ISO-8601 string such as {@code "2026-03-18T08:42:11Z"} — and parse
-     * it directly into an {@link Instant}.
-     *
-     * @param token OAuth2 bearer token
-     * @return the verified scene capture {@link SceneInfo}
-     */
-    private SceneInfo fetchLatestSceneDate(String token) {
-        Instant now = Instant.now();
-        Instant from = now.minus(CATALOGUE_LOOKBACK_DAYS, ChronoUnit.DAYS);
-        // Force ROOT locale so all systems use dots, not commas, in JSON numbers.
-        String catalogueBody = String.format(java.util.Locale.ROOT, """
+    public SatelliteImageResult fetchSatelliteImage() {
+        return fetchSatelliteImage(false);
+    }
+
+    public synchronized SatelliteImageResult fetchSatelliteImage(boolean forceRefresh) {
+        if (forceRefresh) {
+            log.info("Refreshing cached Digital Earth Africa satellite image");
+            cachedImage = null;
+        } else if (cachedImage != null) {
+            log.debug("Serving cached Digital Earth Africa satellite image");
+            return cachedImage;
+        }
+
+        log.info("Searching Digital Earth Africa for Sentinel-2 imagery over Hartbeespoort Dam");
+        JsonNode searchResponse = searchScenes();
+        SceneInfo scene = selectScene(searchResponse);
+        log.info("Selected Digital Earth Africa scene at {} with cloud cover {}%",
+                scene.dateTaken(), Double.isFinite(scene.cloudCover()) ? scene.cloudCover() : "unavailable");
+
+        JsonNode transform = scene.feature().path("assets").path("visual").path("proj:transform");
+        byte[] imageBytes = downloadAndRenderVisualAsset(scene.visualAssetUrl(), transform);
+        Collection collection = new Collection("s2_l2a", "Digital Earth Africa Sentinel-2 L2A");
+        cachedImage = new SatelliteImageResult(imageBytes, scene.dateTaken(), collection, scene.visualAssetUrl());
+        return cachedImage;
+    }
+
+    private JsonNode searchScenes() {
+        String requestBody = String.format(Locale.ROOT, """
                 {
-                  "collections": ["sentinel-2-l2a"],
+                  "collections": ["s2_l2a"],
                   "bbox": [%f, %f, %f, %f],
-                  "datetime": "%s/%s",
-                  "limit": 20
+                  "datetime": "%s",
+                  "limit": 10
                 }
                 """,
-                BBOX_MIN_LON, BBOX_MIN_LAT, BBOX_MAX_LON, BBOX_MAX_LAT,
-                from.toString(), now.toString());
+                BBOX_MIN_LON, BBOX_MIN_LAT, BBOX_MAX_LON, BBOX_MAX_LAT, SEARCH_DATETIME);
 
-        log.debug("Catalogue request:\n{}", catalogueBody);
-
-        JsonNode catalogueResp = webClient.post()
-                .uri(catalogueUrl)
-                .header("Authorization", "Bearer " + token)
+        JsonNode response = webClient.post()
+                .uri(stacSearchUrl)
                 .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.ALL)
-                .bodyValue(catalogueBody)
-                .retrieve()
-                .onStatus(
-                        s -> s.is4xxClientError() || s.is5xxServerError(),
-                        r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("Catalogue API failed: {} — {}", r.statusCode(), body);
-                            return new RuntimeException("Catalogue API failed: " + body);
-                        }))
-                .bodyToMono(JsonNode.class)
-                .block();
-
-        if (catalogueResp == null) {
-            throw new RuntimeException("Null response from Catalogue API");
-        }
-
-        // GeoJSON FeatureCollection → features[0].properties.datetime
-        JsonNode features = catalogueResp.path("features");
-        if (!features.isArray() || features.isEmpty()) {
-            throw new RuntimeException(
-                    "No Sentinel-2 scenes found in the last " + CATALOGUE_LOOKBACK_DAYS
-                            + " days over Hartbeespoort Dam. "
-                            + "Consider increasing CATALOGUE_LOOKBACK_DAYS.");
-        }
-
-        // Filter for cloud cover <= MAX_CLOUD_COVER_PCT and find the most recent
-        JsonNode bestFeature = null;
-        Instant bestDate = null;
-
-        for (JsonNode feature : features) {
-            JsonNode properties = feature.path("properties");
-            double cloudCover = properties.path("eo:cloud_cover").asDouble(100.0);
-            String datetimeStr = properties.path("datetime").asText(null);
-
-            if (datetimeStr != null && cloudCover <= MAX_CLOUD_COVER_PCT) {
-                Instant date = Instant.parse(datetimeStr);
-                if (bestDate == null || date.isAfter(bestDate)) {
-                    bestDate = date;
-                    bestFeature = feature;
-                }
-            }
-        }
-
-        if (bestFeature == null) {
-            throw new RuntimeException(
-                    "No Sentinel-2 scenes found in the last " + CATALOGUE_LOOKBACK_DAYS
-                            + " days with ≤ " + MAX_CLOUD_COVER_PCT + " % cloud cover over Hartbeespoort Dam. "
-                            + "Consider increasing CATALOGUE_LOOKBACK_DAYS.");
-        }
-
-        String collectionId = bestFeature.path("collection").asText();
-        if (collectionId == null || collectionId.isBlank()) {
-            throw new RuntimeException("Catalogue feature is missing collection — raw feature: " + bestFeature);
-        }
-
-        // Map collection ID to display name (hardcoded for now)
-        String displayName = switch (collectionId) {
-            case "sentinel-2-l2a" -> "Sentinel-2 L2A (10 m)";
-            default -> collectionId; // fallback
-        };
-        Collection collection = new Collection(collectionId, displayName);
-
-        String datetimeStr = bestFeature
-                .path("properties")
-                .path("datetime")
-                .asText(null);
-
-        if (datetimeStr == null || datetimeStr.isBlank()) {
-            throw new RuntimeException(
-                    "Catalogue feature is missing properties.datetime — "
-                            + "raw feature: " + bestFeature);
-        }
-
-        log.info("Catalogue properties.datetime = {}", datetimeStr);
-        Instant dateTaken = Instant.parse(datetimeStr); // e.g. "2026-03-18T08:42:11Z"
-        return new SceneInfo(dateTaken, collection);
-    }
-
-    // =========================================================================
-    // Step 3 — Process API: fetch the image pinned to the verified scene date
-    // =========================================================================
-
-    /**
-     * Requests a PNG from the Sentinel Hub Process API.
-     *
-     * The time window is the 24-hour calendar day of {@code dateTaken}
-     * (midnight-to-midnight UTC), ensuring the Process API renders the
-     * same scene that the catalogue identified.
-     *
-     * @param token     OAuth2 bearer token
-     * @param dateTaken exact scene capture time from the catalogue
-     * @return raw PNG bytes
-     */
-    private byte[] fetchImage(String token, Instant dateTaken) {
-        // Pin to the calendar day of the exact scene — midnight UTC to midnight UTC
-        Instant windowStart = dateTaken.truncatedTo(ChronoUnit.DAYS);
-        Instant windowEnd = windowStart.plus(1, ChronoUnit.DAYS);
-
-        String requestBody = buildProcessRequestBody(windowStart, windowEnd);
-        log.debug("Process API request:\n{}", requestBody);
-
-        byte[] bytes = webClient.post()
-                .uri(processUrl)
-                .header("Authorization", "Bearer " + token)
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.IMAGE_PNG)
+                .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(requestBody)
                 .retrieve()
                 .onStatus(
-                        s -> s.is4xxClientError() || s.is5xxServerError(),
-                        r -> r.bodyToMono(String.class).map(b -> {
-                            log.error("Process API failed: {} — {}", r.statusCode(), b);
-                            return new RuntimeException("Process API failed: " + b);
+                        status -> status.isError(),
+                        result -> result.bodyToMono(String.class).map(body -> {
+                            log.error("Digital Earth Africa STAC search failed: {} — {}",
+                                    result.statusCode(), body);
+                            return new RuntimeException("Digital Earth Africa STAC search failed: " + body);
                         }))
-                .bodyToMono(byte[].class)
+                .bodyToMono(JsonNode.class)
                 .block();
 
-        if (bytes == null || bytes.length == 0) {
-            throw new RuntimeException("Empty image response from Process API");
+        if (response == null) {
+            throw new RuntimeException("Digital Earth Africa STAC search returned an empty response");
         }
-        return bytes;
+        return response;
     }
 
-    // =========================================================================
-    // Process API request body
-    // =========================================================================
+    private SceneInfo selectScene(JsonNode searchResponse) {
+        JsonNode features = searchResponse.path("features");
+        if (!features.isArray()) {
+            throw new RuntimeException("Digital Earth Africa STAC response is missing its features array");
+        }
 
-    /**
-     * Builds the JSON payload for the Sentinel Hub Process API.
-     *
-     * Evalscript: true-colour composite —
-     * B04 (red), B03 (green), B02 (blue), gamma-corrected and scaled to UINT8
-     * (0–255). Using UINT8 is essential: UINT16 output produces a 16-bit PNG
-     * that most browsers and image viewers render as black.
-     *
-     * maxCloudCoverage is intentionally set to {@value #MAX_CLOUD_COVER_PCT} to
-     * match the catalogue filter threshold and avoid no-data (black) renders.
-     *
-     * @param from window start (00:00:00 UTC of the scene's calendar day)
-     * @param to   window end (00:00:00 UTC of the following day)
-     */
-    private String buildProcessRequestBody(Instant from, Instant to) {
-        return String.format(java.util.Locale.ROOT,
-                """
-                {
-                  "input": {
-                    "bounds": {
-                      "bbox": [%f, %f, %f, %f]
-                    },
-                    "data": [{
-                      "type": "sentinel-2-l2a",
-                      "dataFilter": {
-                        "timeRange": {
-                          "from": "%s",
-                          "to":   "%s"
-                        },
-                        "maxCloudCoverage": %s
-                      },
-                      "processing": {
-                        "upsampling":   "BICUBIC",
-                        "downsampling": "BILINEAR"
-                      }
-                    }]
-                  },
-                  "output": {
-                    "resx": 0.0001,
-                    "resy": 0.0001,
-                    "responses": [{
-                      "identifier": "default",
-                      "format": { "type": "image/png" }
-                    }]
-                  },
-                  "evalscript": "//VERSION=3\\nfunction setup() {\\n  return {\\n    input: [\\"B02\\", \\"B03\\", \\"B04\\"],\\n    output: { bands: 3, sampleType: \\"UINT8\\" }\\n  };\\n}\\nfunction evaluatePixel(sample) {\\n  const g = 2.2;\\n  function c(v) { return Math.min(255, Math.round(Math.pow(Math.min(1.0, v * 2.5), 1.0 / g) * 255)); }\\n  return [c(sample.B04), c(sample.B03), c(sample.B02)];\\n}"
+        List<SceneInfo> candidates = new ArrayList<>();
+        for (JsonNode feature : features) {
+            if (!coversDam(feature.path("bbox")) || !geometryCoversDam(feature.path("geometry"))) {
+                continue;
+            }
+
+            String datetime = feature.path("properties").path("datetime").asText(null);
+            String visualHref = feature.path("assets").path("visual").path("href").asText(null);
+            JsonNode transform = feature.path("assets").path("visual").path("proj:transform");
+            if (datetime == null || visualHref == null || !transform.isArray() || transform.size() < 6) {
+                continue;
+            }
+
+            double cloudCover = feature.path("properties").path("eo:cloud_cover").asDouble(Double.NaN);
+            if (Double.isFinite(cloudCover) && cloudCover > MAX_CLOUD_COVER_PCT) {
+                continue;
+            }
+
+            try {
+                candidates.add(new SceneInfo(
+                        Instant.parse(datetime),
+                        cloudCover,
+                        feature,
+                        toDigitalEarthAfricaHttpsUrl(visualHref)));
+            } catch (RuntimeException ex) {
+                log.warn("Skipping unsuitable Digital Earth Africa scene: {}", ex.getMessage());
+            }
+        }
+
+        return candidates.stream()
+                .max(Comparator.comparing(SceneInfo::dateTaken)
+                        .thenComparingDouble(scene -> Double.isFinite(scene.cloudCover())
+                                ? -scene.cloudCover()
+                                : Double.NEGATIVE_INFINITY))
+                .orElseThrow(() -> new SatelliteImageUnavailableException(
+                        "No suitable Digital Earth Africa Sentinel-2 scene is available for Hartbeespoort Dam "
+                                + "in the requested date range"));
+    }
+
+    private boolean coversDam(JsonNode bbox) {
+        return bbox.isArray()
+                && bbox.size() >= 4
+                && bbox.get(0).asDouble(Double.NaN) <= BBOX_MIN_LON
+                && bbox.get(1).asDouble(Double.NaN) <= BBOX_MIN_LAT
+                && bbox.get(2).asDouble(Double.NaN) >= BBOX_MAX_LON
+                && bbox.get(3).asDouble(Double.NaN) >= BBOX_MAX_LAT;
+    }
+
+    private boolean geometryCoversDam(JsonNode geometry) {
+        JsonNode coordinates = geometry.path("coordinates");
+        List<double[]> checkPoints = List.of(
+                new double[] { BBOX_MIN_LON, BBOX_MIN_LAT },
+                new double[] { BBOX_MIN_LON, BBOX_MAX_LAT },
+                new double[] { BBOX_MAX_LON, BBOX_MIN_LAT },
+                new double[] { BBOX_MAX_LON, BBOX_MAX_LAT },
+                new double[] { (BBOX_MIN_LON + BBOX_MAX_LON) / 2, (BBOX_MIN_LAT + BBOX_MAX_LAT) / 2 });
+
+        if ("Polygon".equals(geometry.path("type").asText())) {
+            return polygonCoversDam(coordinates, checkPoints);
+        }
+        if ("MultiPolygon".equals(geometry.path("type").asText()) && coordinates.isArray()) {
+            for (JsonNode polygon : coordinates) {
+                if (polygonCoversDam(polygon, checkPoints)) {
+                    return true;
                 }
-                """,
-                BBOX_MIN_LON, BBOX_MIN_LAT, BBOX_MAX_LON, BBOX_MAX_LAT,
-                from.toString(), to.toString(),
-                (int) MAX_CLOUD_COVER_PCT);
+            }
+        }
+        return false;
+    }
+
+    private boolean polygonCoversDam(JsonNode rings, List<double[]> checkPoints) {
+        if (!rings.isArray() || rings.isEmpty()) {
+            return false;
+        }
+        JsonNode outerRing = rings.get(0);
+        for (double[] point : checkPoints) {
+            if (!pointInRing(outerRing, point[0], point[1])) {
+                return false;
+            }
+            for (int ringIndex = 1; ringIndex < rings.size(); ringIndex++) {
+                if (pointInRing(rings.get(ringIndex), point[0], point[1])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean pointInRing(JsonNode ring, double longitude, double latitude) {
+        boolean inside = false;
+        if (!ring.isArray() || ring.size() < 4) {
+            return false;
+        }
+        for (int i = 0, j = ring.size() - 1; i < ring.size(); j = i++) {
+            JsonNode current = ring.get(i);
+            JsonNode previous = ring.get(j);
+            double currentLon = current.get(0).asDouble();
+            double currentLat = current.get(1).asDouble();
+            double previousLon = previous.get(0).asDouble();
+            double previousLat = previous.get(1).asDouble();
+            boolean crossesLatitude = (currentLat > latitude) != (previousLat > latitude);
+            if (crossesLatitude && longitude < (previousLon - currentLon) * (latitude - currentLat)
+                    / (previousLat - currentLat) + currentLon) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    private String toDigitalEarthAfricaHttpsUrl(String href) {
+        URI uri = URI.create(href);
+        if ("s3".equalsIgnoreCase(uri.getScheme())
+                && "deafrica-sentinel-2".equals(uri.getHost())
+                && uri.getRawPath() != null
+                && !uri.getRawPath().isBlank()) {
+            return "https://" + VISUAL_ASSET_HOST + uri.getRawPath();
+        }
+        if ("https".equalsIgnoreCase(uri.getScheme())
+                && VISUAL_ASSET_HOST.equalsIgnoreCase(uri.getHost())) {
+            return uri.toASCIIString();
+        }
+        throw new IllegalArgumentException("Unexpected Digital Earth Africa visual asset URL: " + href);
+    }
+
+    private byte[] downloadAndRenderVisualAsset(String assetUrl, JsonNode transform) {
+        Path cogFile = null;
+        try {
+            cogFile = Files.createTempFile("deafrica-visual-", ".tif");
+            Path downloadPath = cogFile;
+            try (OutputStream output = Files.newOutputStream(
+                    downloadPath, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                webClient.get()
+                        .uri(assetUrl)
+                        .accept(MediaType.valueOf("image/tiff"))
+                        .retrieve()
+                        .onStatus(
+                                status -> status.isError(),
+                                result -> result.bodyToMono(String.class).map(body -> {
+                                    log.error("Digital Earth Africa visual asset download failed: {} — {}",
+                                            result.statusCode(), body);
+                                    return new RuntimeException("Digital Earth Africa visual asset download failed: "
+                                            + body);
+                                }))
+                        .bodyToFlux(DataBuffer.class)
+                        .doOnNext(buffer -> writeBuffer(output, buffer))
+                        .then()
+                        .block();
+            }
+            return renderCroppedJpeg(downloadPath, transform);
+        } catch (IOException ex) {
+            throw new RuntimeException("Unable to download or render the Digital Earth Africa visual asset", ex);
+        } finally {
+            if (cogFile != null) {
+                try {
+                    Files.deleteIfExists(cogFile);
+                } catch (IOException ex) {
+                    log.warn("Unable to remove temporary Digital Earth Africa asset {}", cogFile, ex);
+                }
+            }
+        }
+    }
+
+    private void writeBuffer(OutputStream output, DataBuffer buffer) {
+        try {
+            byte[] bytes = new byte[buffer.readableByteCount()];
+            buffer.read(bytes);
+            output.write(bytes);
+        } catch (IOException ex) {
+            throw new RuntimeException("Unable to save the Digital Earth Africa visual asset", ex);
+        } finally {
+            DataBufferUtils.release(buffer);
+        }
+    }
+
+    private byte[] renderCroppedJpeg(Path cogeFile, JsonNode transform) throws IOException {
+        double pixelX = transform.get(0).asDouble();
+        double rotationX = transform.get(1).asDouble();
+        double originX = transform.get(2).asDouble();
+        double rotationY = transform.get(3).asDouble();
+        double pixelY = transform.get(4).asDouble();
+        double originY = transform.get(5).asDouble();
+
+        List<double[]> projectedCorners = List.of(
+                wgs84ToUtm35South(BBOX_MIN_LON, BBOX_MIN_LAT),
+                wgs84ToUtm35South(BBOX_MIN_LON, BBOX_MAX_LAT),
+                wgs84ToUtm35South(BBOX_MAX_LON, BBOX_MIN_LAT),
+                wgs84ToUtm35South(BBOX_MAX_LON, BBOX_MAX_LAT));
+
+        double minPixelX = Double.POSITIVE_INFINITY;
+        double maxPixelX = Double.NEGATIVE_INFINITY;
+        double minPixelY = Double.POSITIVE_INFINITY;
+        double maxPixelY = Double.NEGATIVE_INFINITY;
+        double determinant = pixelX * pixelY - rotationX * rotationY;
+        if (Math.abs(determinant) < 1e-12) {
+            throw new IOException("Digital Earth Africa visual asset has an invalid georeferencing transform");
+        }
+
+        for (double[] corner : projectedCorners) {
+            double dx = corner[0] - originX;
+            double dy = corner[1] - originY;
+            double x = (dx * pixelY - rotationX * dy) / determinant;
+            double y = (pixelX * dy - dx * rotationY) / determinant;
+            minPixelX = Math.min(minPixelX, x);
+            maxPixelX = Math.max(maxPixelX, x);
+            minPixelY = Math.min(minPixelY, y);
+            maxPixelY = Math.max(maxPixelY, y);
+        }
+
+        try (ImageInputStream input = ImageIO.createImageInputStream(cogeFile.toFile())) {
+            if (input == null) {
+                throw new IOException("Unable to open the downloaded Digital Earth Africa GeoTIFF");
+            }
+            Iterator<ImageReader> readers = ImageIO.getImageReaders(input);
+            if (!readers.hasNext()) {
+                throw new IOException("No Java ImageIO reader can decode the Digital Earth Africa GeoTIFF");
+            }
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(input, true, true);
+                int imageWidth = reader.getWidth(0);
+                int imageHeight = reader.getHeight(0);
+                int x = Math.max(0, (int) Math.floor(minPixelX));
+                int y = Math.max(0, (int) Math.floor(minPixelY));
+                int right = Math.min(imageWidth, (int) Math.ceil(maxPixelX));
+                int bottom = Math.min(imageHeight, (int) Math.ceil(maxPixelY));
+                if (right <= x || bottom <= y) {
+                    throw new IOException("The Digital Earth Africa scene does not overlap the dam bounding box");
+                }
+
+                Rectangle region = new Rectangle(x, y, right - x, bottom - y);
+                int subsampling = Math.max(1, (int) Math.ceil(Math.max(
+                        (double) region.width / MAX_PREVIEW_WIDTH,
+                        (double) region.height / MAX_PREVIEW_HEIGHT)));
+                ImageReadParam readParam = reader.getDefaultReadParam();
+                readParam.setSourceRegion(region);
+                readParam.setSourceSubsampling(subsampling, subsampling, 0, 0);
+
+                BufferedImage source = reader.read(0, readParam);
+                BufferedImage rgb = new BufferedImage(source.getWidth(), source.getHeight(), BufferedImage.TYPE_INT_RGB);
+                Graphics2D graphics = rgb.createGraphics();
+                try {
+                    graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                    graphics.drawImage(source, new AffineTransform(), null);
+                } finally {
+                    graphics.dispose();
+                }
+
+                try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                    if (!ImageIO.write(rgb, "jpg", output)) {
+                        throw new IOException("No Java ImageIO JPEG writer is available");
+                    }
+                    return output.toByteArray();
+                }
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    private double[] wgs84ToUtm35South(double longitude, double latitude) {
+        double semiMajorAxis = 6_378_137.0;
+        double eccentricitySquared = 0.00669437999014;
+        double secondEccentricitySquared = eccentricitySquared / (1.0 - eccentricitySquared);
+        double scale = 0.9996;
+        double latitudeRadians = Math.toRadians(latitude);
+        double longitudeRadians = Math.toRadians(longitude);
+        double centralMeridian = Math.toRadians(27.0);
+        double sinLatitude = Math.sin(latitudeRadians);
+        double cosLatitude = Math.cos(latitudeRadians);
+        double tanLatitude = Math.tan(latitudeRadians);
+        double n = semiMajorAxis / Math.sqrt(1.0 - eccentricitySquared * sinLatitude * sinLatitude);
+        double t = tanLatitude * tanLatitude;
+        double c = secondEccentricitySquared * cosLatitude * cosLatitude;
+        double a = cosLatitude * (longitudeRadians - centralMeridian);
+        double e4 = eccentricitySquared * eccentricitySquared;
+        double e6 = e4 * eccentricitySquared;
+        double meridionalArc = semiMajorAxis * (
+                (1 - eccentricitySquared / 4 - 3 * e4 / 64 - 5 * e6 / 256) * latitudeRadians
+                        - (3 * eccentricitySquared / 8 + 3 * e4 / 32 + 45 * e6 / 1024)
+                                * Math.sin(2 * latitudeRadians)
+                        + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * latitudeRadians)
+                        - (35 * e6 / 3072) * Math.sin(6 * latitudeRadians));
+        double easting = 500_000 + scale * n * (
+                a + (1 - t + c) * Math.pow(a, 3) / 6
+                        + (5 - 18 * t + t * t + 72 * c - 58 * secondEccentricitySquared)
+                                * Math.pow(a, 5) / 120);
+        double northing = scale * (
+                meridionalArc + n * tanLatitude * (
+                        a * a / 2
+                                + (5 - t + 9 * c + 4 * c * c) * Math.pow(a, 4) / 24
+                                + (61 - 58 * t + t * t + 600 * c - 330 * secondEccentricitySquared)
+                                        * Math.pow(a, 6) / 720))
+                + 10_000_000;
+        return new double[] { easting, northing };
     }
 }

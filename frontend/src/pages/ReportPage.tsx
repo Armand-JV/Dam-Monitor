@@ -22,7 +22,10 @@ interface PinPosition {
 
 export default function ReportPage() {
   const navigate = useNavigate();
-  const [cacheBuster, setCacheBuster] = useState(Date.now());
+  const [satelliteRequest, setSatelliteRequest] = useState({
+    cacheBuster: Date.now(),
+    forceRefresh: false
+  });
   const [satelliteResolution, setSatelliteResolution] = useState<{ width: number; height: number } | null>(null);
   const [selectedSatellitePixel, setSelectedSatellitePixel] = useState<{ x: number; y: number } | null>(null);
   const [selectedCoordinates, setSelectedCoordinates] = useState<{ lat: number; lon: number } | null>(null);
@@ -170,7 +173,10 @@ export default function ReportPage() {
       setSatelliteCollection(null);
 
       try {
-        const snapshot = await fetchSatelliteSnapshot(cacheBuster);
+        const snapshot = await fetchSatelliteSnapshot(
+          satelliteRequest.cacheBuster,
+          satelliteRequest.forceRefresh
+        );
         if (!isMounted) {
           URL.revokeObjectURL(snapshot.objectUrl);
           return;
@@ -204,12 +210,12 @@ export default function ReportPage() {
         URL.revokeObjectURL(currentObjectUrl);
       }
     };
-  }, [cacheBuster]);
+  }, [satelliteRequest]);
 
   useEffect(() => {
     setSelectedSatellitePixel(null);
     setSelectedCoordinates(null);
-  }, [cacheBuster]);
+  }, [satelliteRequest.cacheBuster]);
 
   // Cleanup preview URL on unmount
   useEffect(() => {
@@ -225,7 +231,10 @@ export default function ReportPage() {
     setSelectedSatellitePixel(null);
     setPinPosition(null);
     resetZoom();
-    setCacheBuster(Date.now());
+    setSatelliteRequest((previous) => ({
+      cacheBuster: previous.cacheBuster + 1,
+      forceRefresh: true
+    }));
   }
 
   function onSatelliteImageClick(event: React.MouseEvent<HTMLImageElement>) {
